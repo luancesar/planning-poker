@@ -72,7 +72,7 @@ Custo: **R$ 0** para validar com times reais. Limites conferidos em outubro de 2
 
 O Postgres gratuito do próprio Render expira, por isso o banco fica na Neon.
 
-1. **Banco**: crie um projeto na [Neon](https://neon.com) (região AWS US West / Oregon, a mesma do `render.yaml`) e copie a connection string (`postgres://...neon.tech/neondb?sslmode=require`).
+1. **Banco**: crie um projeto na [Neon](https://neon.com) (região **AWS US East 1 / N. Virginia**, a mesma do `render.yaml`; o Render não tem região na América do Sul) e copie a connection string (`postgres://...neon.tech/neondb?sslmode=require`).
 2. **Código**: suba este repositório para o GitHub.
 3. **App**: no Render, *New → Blueprint*, escolha o repositório (ele lê o `render.yaml`) e cole a connection string em `DATABASE_URL`. As tabelas são criadas sozinhas no primeiro start.
 4. Abra `https://<seu-app>.onrender.com`, crie uma sala e mande o link para o time.

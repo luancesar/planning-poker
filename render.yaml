@@ -5,7 +5,7 @@ services:
     name: planning-poker
     runtime: node
     plan: free
-    region: oregon
+    region: virginia
     buildCommand: npm ci && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
