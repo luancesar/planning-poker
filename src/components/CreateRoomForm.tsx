@@ -14,7 +14,7 @@ export function CreateRoomForm() {
   const [nickname, setNickname] = useState('');
   const [deckId, setDeckId] = useState('fibonacci');
   const [customCards, setCustomCards] = useState('1, 2, 3, 5, 8, ?');
-  const [autoReveal, setAutoReveal] = useState(DEFAULT_SETTINGS.autoReveal);
+  const [requireApproval, setRequireApproval] = useState(DEFAULT_SETTINGS.requireApproval);
   const [facilitatorVotes, setFacilitatorVotes] = useState(DEFAULT_SETTINGS.facilitatorVotes);
   const [timer, setTimer] = useState('');
   const [persistent, setPersistent] = useState(true);
@@ -47,7 +47,7 @@ export function CreateRoomForm() {
         nickname,
         deckId,
         customCards: deckId === 'custom' ? customCards : undefined,
-        settings: { autoReveal, facilitatorVotes, timerSeconds: timer ? Number(timer) : null },
+        settings: { ...DEFAULT_SETTINGS, requireApproval, facilitatorVotes, timerSeconds: timer ? Number(timer) : null },
         persistent,
         password: password || undefined,
       });
@@ -96,10 +96,15 @@ export function CreateRoomForm() {
       </button>
       {showAdvanced && (
         <div className="flex flex-col gap-4 rounded-lg border border-line bg-surface-2/50 p-4">
-          <Toggle checked={autoReveal} onChange={setAutoReveal} label="Revelar automaticamente" hint="Quando todos os votantes online tiverem votado" />
+          <Toggle
+            checked={requireApproval}
+            onChange={setRequireApproval}
+            label="Aprovar quem vota"
+            hint="Quem entra fica como observador até você liberar o voto. Evita votos de quem só recebeu o link."
+          />
           <Toggle checked={facilitatorVotes} onChange={setFacilitatorVotes} label="Facilitador também vota" />
           <Toggle checked={persistent} onChange={setPersistent} label="Sala persistente" hint="Reutilize o mesmo link em todas as sprints. Desligado: expira em 24 h sem uso." />
-          <Field label="Timer por rodada">
+          <Field label="Timer por rodada" hint="Quando o tempo acaba a votação fecha, mas os votos só aparecem quando alguém revelar.">
             <Select value={timer} onChange={(e) => setTimer(e.target.value)}>
               <option value="">Sem timer</option>
               <option value="30">30 segundos</option>

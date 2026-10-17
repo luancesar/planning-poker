@@ -128,7 +128,8 @@ function EditItemModal({ item, onClose, run }: { item: ItemView | null; onClose:
 
 export function ItemsPanel({ state, run, selectedItemId, onSelect }: { state: RoomState; run: Run; selectedItemId: string | null; onSelect: (id: string) => void }) {
   const { items, room, me } = state;
-  const isFacilitator = me.role === 'facilitator';
+  const canItems = me.can.items;
+  const canRounds = me.can.rounds;
   const [title, setTitle] = useState('');
   const [bulkOpen, setBulkOpen] = useState(false);
   const [editing, setEditing] = useState<ItemView | null>(null);
@@ -149,14 +150,14 @@ export function ItemsPanel({ state, run, selectedItemId, onSelect }: { state: Ro
             {estimated.length} de {items.length} estimados{points !== null && estimated.length > 0 && ` · ${points.toLocaleString('pt-BR')} pontos`}
           </p>
         </div>
-        {isFacilitator && (
+        {canItems && (
           <Button size="sm" variant="ghost" onClick={() => setBulkOpen(true)}>
             + Vários
           </Button>
         )}
       </div>
 
-      {isFacilitator && (
+      {canItems && (
         <form
           className="flex gap-2 border-b border-line p-3"
           onSubmit={async (e) => {
@@ -172,7 +173,7 @@ export function ItemsPanel({ state, run, selectedItemId, onSelect }: { state: Ro
       )}
 
       {items.length === 0 ? (
-        <p className="p-6 text-center text-sm text-muted">{isFacilitator ? 'Adicione o primeiro item para começar.' : 'O facilitador ainda não adicionou itens.'}</p>
+        <p className="p-6 text-center text-sm text-muted">{canItems ? 'Adicione o primeiro item para começar.' : 'O facilitador ainda não adicionou itens.'}</p>
       ) : (
         <ol className="flex-1 overflow-y-auto p-2" onDragLeave={() => setDropIndex(null)}>
           {items.map((item, index) => {
@@ -181,7 +182,7 @@ export function ItemsPanel({ state, run, selectedItemId, onSelect }: { state: Ro
             return (
               <li
                 key={item.id}
-                draggable={isFacilitator}
+                draggable={canItems}
                 onDragStart={(e) => {
                   setDragId(item.id);
                   e.dataTransfer.effectAllowed = 'move';
@@ -214,7 +215,7 @@ export function ItemsPanel({ state, run, selectedItemId, onSelect }: { state: Ro
                   dropIndex === index + 1 && index === items.length - 1 && 'shadow-[inset_0_-2px_0_var(--app-accent)]',
                 )}
               >
-                {isFacilitator && (
+                {canItems && (
                   <span aria-hidden className="mt-0.5 cursor-grab text-muted opacity-40 group-hover:opacity-100">
                     ⠿
                   </span>
@@ -229,9 +230,9 @@ export function ItemsPanel({ state, run, selectedItemId, onSelect }: { state: Ro
                     {commentCount > 0 && <span className="text-xs text-muted">💬 {commentCount}</span>}
                   </span>
                 </button>
-                {isFacilitator && (
+                {(canItems || canRounds) && (
                   <div className="flex shrink-0 items-center">
-                    {!current && item.status !== 'estimated' && (
+                    {canRounds && !current && item.status !== 'estimated' && (
                       <Button size="sm" variant="ghost" className="text-accent" onClick={() => run({ type: 'round.start', itemId: item.id })}>
                         Votar
                       </Button>
@@ -239,13 +240,14 @@ export function ItemsPanel({ state, run, selectedItemId, onSelect }: { state: Ro
                     <Menu
                       label={`Ações para ${item.title}`}
                       items={[
-                        { label: 'Votar novamente', hidden: item.status !== 'estimated', onSelect: () => run({ type: 'round.start', itemId: item.id }) },
-                        { label: 'Editar', onSelect: () => setEditing(item) },
-                        { label: 'Reabrir', hidden: item.status !== 'estimated' && item.status !== 'skipped', onSelect: () => run({ type: 'item.reopen', itemId: item.id }) },
-                        { label: 'Pular', hidden: item.status === 'skipped' || item.status === 'estimated', onSelect: () => run({ type: 'item.skip', itemId: item.id }) },
+                        { label: 'Votar novamente', hidden: !canRounds || item.status !== 'estimated', onSelect: () => run({ type: 'round.start', itemId: item.id }) },
+                        { label: 'Editar', hidden: !canItems, onSelect: () => setEditing(item) },
+                        { label: 'Reabrir', hidden: !canItems || (item.status !== 'estimated' && item.status !== 'skipped'), onSelect: () => run({ type: 'item.reopen', itemId: item.id }) },
+                        { label: 'Pular', hidden: !canRounds || item.status === 'skipped' || item.status === 'estimated', onSelect: () => run({ type: 'item.skip', itemId: item.id }) },
                         {
                           label: 'Excluir',
                           danger: true,
+                          hidden: !canItems,
                           onSelect: () => confirm(`Excluir "${item.title}" com votos e comentários?`) && run({ type: 'item.delete', itemId: item.id }),
                         },
                       ]}

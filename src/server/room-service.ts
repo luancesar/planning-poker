@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, isNull, max, or, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, inArray, isNull, max, or, sql } from 'drizzle-orm';
 import type pg from 'pg';
 import { resolveDeck } from '../shared/decks';
 import {
@@ -8,9 +8,11 @@ import {
   type CreateRoomInput,
   type JoinResponse,
   type JoinRoomInput,
+  type PermissionKey,
   type ParsedAction,
   type RoomPreview,
 } from '../shared/protocol';
+import { permissionsFor } from '../shared/permissions';
 import { computeStats } from '../shared/stats';
 import { hashPassword, hashToken, newRoomCode, newToken, normalizeCode, verifyPassword } from './auth';
 import { connOn, type Db, type DbOrTx, type Tx } from './db/client';
@@ -73,7 +75,14 @@ export async function getRoomPreview(db: Db, code: string): Promise<RoomPreview>
     .select({ n: count() })
     .from(participants)
     .where(and(eq(participants.roomId, room.id), isNull(participants.removedAt)));
-  return { code: room.code, name: room.name, hasPassword: !!room.passwordHash, deckName: room.deck.name, participantCount: n };
+  return {
+    code: room.code,
+    name: room.name,
+    hasPassword: !!room.passwordHash,
+    requireApproval: room.settings.requireApproval,
+    deckName: room.deck.name,
+    participantCount: n,
+  };
 }
 
 export async function joinRoom(db: Db, code: string, input: JoinRoomInput): Promise<JoinResponse> {
@@ -90,11 +99,13 @@ export async function joinRoom(db: Db, code: string, input: JoinRoomInput): Prom
       .from(participants)
       .where(and(eq(participants.roomId, room.id), isNull(participants.removedAt)));
     if (n >= LIMITS.participantsPerRoom) throw new ActionError(`A sala atingiu o limite de ${LIMITS.participantsPerRoom} participantes`, 403);
+    // With approval on, a would-be voter joins as an observer with a pending request.
+    const pending = data.role === 'voter' && room.settings.requireApproval;
     const [p] = await tx
       .insert(participants)
-      .values({ roomId: room.id, nickname: data.nickname, role: data.role, tokenHash: hashToken(token) })
+      .values({ roomId: room.id, nickname: data.nickname, role: pending ? 'observer' : data.role, voteRequested: pending, tokenHash: hashToken(token) })
       .returning();
-    return { code: room.code, token, participantId: p.id };
+    return { code: room.code, token, participantId: p.id, pending };
   });
 }
 
@@ -249,31 +260,8 @@ export async function revealRound(tx: Tx, room: LockedRoom, round: RoundRow, kno
   if (room.$round?.id === round.id) room.$round = { ...round, revealedAt, stats };
 }
 
-const canVote = (p: Pick<ParticipantRow, 'role'>, room: RoomRow) =>
-  p.role === 'voter' || (p.role === 'facilitator' && room.settings.facilitatorVotes);
-
-type VoteStatus = { id: string; role: ParticipantRow['role']; cardLabel: string | null };
-
-/** Reveals the round if every online voter has a vote; `rows` = every active participant and their vote. */
-async function revealIfEveryoneVoted(tx: Tx, room: LockedRoom, round: RoundRow, rows: VoteStatus[], online: Set<string>) {
-  const eligible = rows.filter((p) => online.has(p.id) && canVote(p, room));
-  if (eligible.length === 0 || !eligible.every((p) => p.cardLabel !== null)) return;
-  const cast = rows.filter((r): r is VoteStatus & { cardLabel: string } => r.cardLabel !== null);
-  await revealRound(tx, room, round, cast);
-}
-
-/** Reveals the open round once every online voter has voted (if the room enables it). */
-export async function maybeAutoReveal(tx: Tx, room: LockedRoom, online: Set<string>) {
-  if (!room.settings.autoReveal) return;
-  const round = await openRound(tx, room);
-  if (!round) return;
-  const rows = await tx
-    .select({ id: participants.id, role: participants.role, cardLabel: votes.cardLabel })
-    .from(participants)
-    .leftJoin(votes, and(eq(votes.participantId, participants.id), eq(votes.roundId, round.id)))
-    .where(and(eq(participants.roomId, room.id), isNull(participants.removedAt)));
-  await revealIfEveryoneVoted(tx, room, round, rows, online);
-}
+/** Voting closes when the round timer runs out; votes stay hidden until someone reveals them. */
+const timeIsUp = (round: RoundRow) => !!round.endsAt && round.endsAt.getTime() <= Date.now();
 
 /** Moves to the first pending item after `afterPosition` (wrapping around); clears the current item when none is left. */
 async function advance(tx: Tx, room: LockedRoom, afterPosition: number) {
@@ -298,6 +286,16 @@ function requireFacilitator(actor: ParticipantRow) {
   if (actor.role !== 'facilitator') throw new ActionError('Apenas o facilitador pode fazer isso', 403);
 }
 
+const DENIED: Record<PermissionKey, string> = {
+  reveal: 'Você não tem permissão para revelar os votos',
+  rounds: 'Você não tem permissão para controlar as rodadas',
+  items: 'Você não tem permissão para gerenciar os itens',
+};
+
+function requirePermission(actor: ParticipantRow, room: RoomRow, key: PermissionKey) {
+  if (!permissionsFor(actor, room.settings)[key]) throw new ActionError(DENIED[key], 403);
+}
+
 async function getItem(tx: Tx, room: RoomRow, itemId: string) {
   const [item] = await tx.select().from(items).where(and(eq(items.id, itemId), eq(items.roomId, room.id)));
   if (!item) throw new ActionError('Item não encontrado', 404);
@@ -320,10 +318,6 @@ async function getTarget(tx: Tx, room: RoomRow, participantId: string) {
   return p;
 }
 
-/** Actions after which every online voter may have voted, which can complete the round. */
-// vote.cast checks this itself, in the same statement that saves the vote.
-const CAN_COMPLETE_ROUND = new Set<ParsedAction['type']>(['participant.setRole', 'participant.remove', 'room.update']);
-
 export async function applyAction(
   tx: Tx,
   room: LockedRoom,
@@ -335,48 +329,39 @@ export async function applyAction(
 
   switch (action.type) {
     case 'vote.cast': {
-      if (!canVote(actor, room)) throw new ActionError('Seu papel nesta sala não permite votar', 403);
+      if (!permissionsFor(actor, room.settings).vote) throw new ActionError('Seu papel nesta sala não permite votar', 403);
       const round = await openRound(tx, room);
       if (!round) throw new ActionError('Não há votação aberta');
+      if (timeIsUp(round)) throw new ActionError('O tempo da rodada acabou');
       const card = room.deck.cards.find((c) => c.label === action.label);
       if (!card) throw new ActionError('Card inválido');
-      // Saves the vote and reads everyone's vote status in a single statement (one round trip).
-      const status = await tx.execute<{ id: string; role: ParticipantRow['role']; card_label: string | null }>(sql`
-        with cast_vote as (
-          insert into ${votes} (round_id, participant_id, card_label, numeric_value)
-          values (${round.id}, ${actor.id}, ${card.label}, ${card.value})
-          on conflict (round_id, participant_id)
-            do update set card_label = excluded.card_label, numeric_value = excluded.numeric_value, updated_at = now()
-          returning participant_id, card_label
-        )
-        select p.id, p.role, coalesce(c.card_label, v.card_label) as card_label
-        from ${participants} p
-        left join ${votes} v on v.participant_id = p.id and v.round_id = ${round.id}
-        left join cast_vote c on c.participant_id = p.id
-        where p.room_id = ${room.id} and p.removed_at is null`);
-      if (room.settings.autoReveal) {
-        const rows = status.rows.map((r) => ({ id: r.id, role: r.role, cardLabel: r.card_label }));
-        await revealIfEveryoneVoted(tx, room, round, rows, ctx.online);
-      }
+      await tx
+        .insert(votes)
+        .values({ roundId: round.id, participantId: actor.id, cardLabel: card.label, numericValue: card.value })
+        .onConflictDoUpdate({
+          target: [votes.roundId, votes.participantId],
+          set: { cardLabel: card.label, numericValue: card.value, updatedAt: new Date() },
+        });
       break;
     }
 
     case 'vote.retract': {
       const round = await openRound(tx, room);
       if (!round) throw new ActionError('Não há votação aberta');
+      if (timeIsUp(round)) throw new ActionError('O tempo da rodada acabou');
       await tx.delete(votes).where(and(eq(votes.roundId, round.id), eq(votes.participantId, actor.id)));
       break;
     }
 
     case 'round.start': {
-      requireFacilitator(actor);
+      requirePermission(actor, room, 'rounds');
       const item = await getItem(tx, room, action.itemId);
       await startRound(tx, room, item.id);
       break;
     }
 
     case 'round.reveal': {
-      requireFacilitator(actor);
+      requirePermission(actor, room, 'reveal');
       const round = await openRound(tx, room);
       if (!round) throw new ActionError('Não há votação aberta');
       await revealRound(tx, room, round);
@@ -384,14 +369,14 @@ export async function applyAction(
     }
 
     case 'round.reset': {
-      requireFacilitator(actor);
+      requirePermission(actor, room, 'rounds');
       if (!room.currentItemId) throw new ActionError('Selecione um item primeiro');
       await startRound(tx, room, room.currentItemId);
       break;
     }
 
     case 'item.finalize': {
-      requireFacilitator(actor);
+      requirePermission(actor, room, 'rounds');
       const item = await getItem(tx, room, action.itemId);
       if (!room.deck.cards.some((c) => c.label === action.estimate)) throw new ActionError('Estimativa precisa ser um card do deck');
       if (room.currentItemId === item.id) {
@@ -404,7 +389,7 @@ export async function applyAction(
     }
 
     case 'item.skip': {
-      requireFacilitator(actor);
+      requirePermission(actor, room, 'rounds');
       const item = await getItem(tx, room, action.itemId);
       await tx.update(items).set({ status: 'skipped' }).where(eq(items.id, item.id));
       if (room.currentItemId === item.id) await advance(tx, room, item.position);
@@ -412,7 +397,7 @@ export async function applyAction(
     }
 
     case 'item.reopen': {
-      requireFacilitator(actor);
+      requirePermission(actor, room, 'items');
       const item = await getItem(tx, room, action.itemId);
       await tx.update(items).set({ status: 'pending', finalEstimate: null }).where(eq(items.id, item.id));
       if (room.currentItemId === item.id) await startRound(tx, room, item.id);
@@ -420,7 +405,7 @@ export async function applyAction(
     }
 
     case 'item.add': {
-      requireFacilitator(actor);
+      requirePermission(actor, room, 'items');
       const [{ n, last }] = await tx
         .select({ n: count(), last: max(items.position) })
         .from(items)
@@ -440,7 +425,7 @@ export async function applyAction(
     }
 
     case 'item.update': {
-      requireFacilitator(actor);
+      requirePermission(actor, room, 'items');
       await getItem(tx, room, action.itemId);
       const patch: Partial<typeof items.$inferInsert> = {};
       if (action.title !== undefined) patch.title = action.title;
@@ -451,7 +436,7 @@ export async function applyAction(
     }
 
     case 'item.delete': {
-      requireFacilitator(actor);
+      requirePermission(actor, room, 'items');
       await getItem(tx, room, action.itemId);
       if (room.currentItemId === action.itemId) room.currentItemId = null;
       await tx.delete(items).where(eq(items.id, action.itemId));
@@ -459,7 +444,7 @@ export async function applyAction(
     }
 
     case 'item.move': {
-      requireFacilitator(actor);
+      requirePermission(actor, room, 'items');
       const ordered = await tx
         .select({ id: items.id, position: items.position })
         .from(items)
@@ -542,7 +527,7 @@ export async function applyAction(
           .where(and(eq(participants.roomId, room.id), eq(participants.role, 'facilitator'), isNull(participants.removedAt)));
         if (n <= 1) throw new ActionError('A sala precisa de pelo menos um facilitador');
       }
-      await tx.update(participants).set({ role: action.role }).where(eq(participants.id, target.id));
+      await tx.update(participants).set({ role: action.role, voteRequested: false }).where(eq(participants.id, target.id));
       if (action.role === 'observer') {
         const round = await openRound(tx, room);
         if (round) await tx.delete(votes).where(and(eq(votes.roundId, round.id), eq(votes.participantId, target.id)));
@@ -567,42 +552,66 @@ export async function applyAction(
       break;
     }
 
+    case 'participant.setCanReveal': {
+      requireFacilitator(actor);
+      const target = await getTarget(tx, room, action.participantId);
+      await tx.update(participants).set({ canReveal: action.canReveal }).where(eq(participants.id, target.id));
+      break;
+    }
+
+    case 'participant.requestVote': {
+      if (actor.role !== 'observer') throw new ActionError('Você já pode votar');
+      if (!room.settings.requireApproval) {
+        await tx.update(participants).set({ role: 'voter', voteRequested: false }).where(eq(participants.id, actor.id));
+      } else {
+        await tx.update(participants).set({ voteRequested: true }).where(eq(participants.id, actor.id));
+      }
+      break;
+    }
+
+    case 'participant.reviewVote': {
+      requireFacilitator(actor);
+      await tx
+        .update(participants)
+        .set(action.approve ? { role: 'voter', voteRequested: false } : { voteRequested: false })
+        .where(
+          and(
+            eq(participants.roomId, room.id),
+            inArray(participants.id, action.participantIds),
+            eq(participants.voteRequested, true),
+            isNull(participants.removedAt),
+          ),
+        );
+      break;
+    }
+
     case 'room.update': {
       requireFacilitator(actor);
       const patch: Partial<typeof rooms.$inferInsert> = {};
       if (action.name) patch.name = action.name;
       if (action.settings) {
-        room.settings = { ...room.settings, ...action.settings };
+        const { permissions, ...rest } = action.settings;
+        room.settings = { ...room.settings, ...rest, permissions: { ...room.settings.permissions, ...permissions } };
         patch.settings = room.settings;
+        // Turning approval off lets everyone who was waiting vote right away.
+        if (rest.requireApproval === false) {
+          await tx
+            .update(participants)
+            .set({ role: 'voter', voteRequested: false })
+            .where(and(eq(participants.roomId, room.id), eq(participants.voteRequested, true), isNull(participants.removedAt)));
+        }
       }
       if (Object.keys(patch).length) await tx.update(rooms).set(patch).where(eq(rooms.id, room.id));
       break;
     }
   }
 
-  if (CAN_COMPLETE_ROUND.has(action.type)) await maybeAutoReveal(tx, room, ctx.online);
   return result;
 }
 
 // ---------------------------------------------------------------------------
 // Background jobs
 // ---------------------------------------------------------------------------
-
-/** Rounds whose timer ran out but are still hidden. */
-export async function expiredRounds(db: Db) {
-  return db
-    .select({ roundId: rounds.id, roomId: items.roomId })
-    .from(rounds)
-    .innerJoin(items, eq(items.id, rounds.itemId))
-    .where(and(isNull(rounds.revealedAt), sql`${rounds.endsAt} <= now()`));
-}
-
-export async function revealExpired(db: Db, roomId: string, roundId: string) {
-  await withRoomLock(db, roomId, async (tx, room) => {
-    const [round] = await tx.select().from(rounds).where(and(eq(rounds.id, roundId), isNull(rounds.revealedAt)));
-    if (round) await revealRound(tx, room, round);
-  });
-}
 
 export async function deleteExpiredRooms(db: Db) {
   const deleted = await db.delete(rooms).where(sql`${rooms.expiresAt} < now()`).returning({ id: rooms.id });

@@ -23,15 +23,41 @@ export type Role = z.infer<typeof RoleSchema>;
 export const ItemStatusSchema = z.enum(['pending', 'voting', 'estimated', 'skipped']);
 export type ItemStatus = z.infer<typeof ItemStatusSchema>;
 
+/** Who may perform a group of actions; facilitators can always do everything. */
+export const PermissionLevelSchema = z.enum(['facilitators', 'voters']);
+export type PermissionLevel = z.infer<typeof PermissionLevelSchema>;
+
+export const PermissionsSchema = z.object({
+  /** Reveal the votes of a round (people can also be granted this one by one). */
+  reveal: PermissionLevelSchema,
+  /** Start, restart and skip rounds, and set the final estimate. */
+  rounds: PermissionLevelSchema,
+  /** Add, edit, delete, reorder and reopen items. */
+  items: PermissionLevelSchema,
+});
+export type Permissions = z.infer<typeof PermissionsSchema>;
+export type PermissionKey = keyof Permissions;
+
 export const RoomSettingsSchema = z.object({
-  autoReveal: z.boolean(),
-  /** Seconds per round; null disables the timer. */
+  /** Seconds per round; null disables the timer. When it runs out voting closes, but votes stay hidden. */
   timerSeconds: z.number().int().min(30).max(300).nullable(),
   facilitatorVotes: z.boolean(),
+  /** New voters join as observers until a facilitator approves them. */
+  requireApproval: z.boolean(),
+  permissions: PermissionsSchema,
 });
 export type RoomSettings = z.infer<typeof RoomSettingsSchema>;
 
-export const DEFAULT_SETTINGS: RoomSettings = { autoReveal: true, timerSeconds: null, facilitatorVotes: true };
+export const DEFAULT_SETTINGS: RoomSettings = {
+  timerSeconds: null,
+  facilitatorVotes: true,
+  requireApproval: true,
+  permissions: { reveal: 'facilitators', rounds: 'facilitators', items: 'facilitators' },
+};
+
+export const RoomSettingsPatchSchema = RoomSettingsSchema.omit({ permissions: true })
+  .partial()
+  .extend({ permissions: PermissionsSchema.partial().optional() });
 
 const nickname = z.string().trim().min(1, 'Informe um apelido').max(LIMITS.nickname);
 const id = z.string().uuid();
@@ -70,8 +96,10 @@ export const JoinRoomSchema = z.object({
 });
 export type JoinRoomInput = z.input<typeof JoinRoomSchema>;
 
-export type JoinResponse = { code: string; token: string; participantId: string };
-export type RoomPreview = { code: string; name: string; hasPassword: boolean; deckName: string; participantCount: number };
+export type RoomPreview = { code: string; name: string; hasPassword: boolean; requireApproval: boolean; deckName: string; participantCount: number };
+
+/** `pending` = asked to vote and waits for a facilitator's approval (joined as observer). */
+export type JoinResponse = { code: string; token: string; participantId: string; pending?: boolean };
 
 // ---- Realtime actions (client -> server) ----
 
@@ -108,10 +136,13 @@ export const ActionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('participant.setRole'), participantId: id, role: RoleSchema }),
   z.object({ type: z.literal('participant.remove'), participantId: id }),
   z.object({ type: z.literal('participant.rename'), nickname }),
+  z.object({ type: z.literal('participant.setCanReveal'), participantId: id, canReveal: z.boolean() }),
+  z.object({ type: z.literal('participant.requestVote') }),
+  z.object({ type: z.literal('participant.reviewVote'), participantIds: z.array(id).min(1).max(LIMITS.participantsPerRoom), approve: z.boolean() }),
   z.object({
     type: z.literal('room.update'),
     name: z.string().trim().min(1).max(LIMITS.roomName).optional(),
-    settings: RoomSettingsSchema.partial().optional(),
+    settings: RoomSettingsPatchSchema.optional(),
   }),
 ]);
 export type Action = z.input<typeof ActionSchema>;
@@ -121,7 +152,17 @@ export type ActionAck = { ok: true } | { ok: false; error: string };
 
 // ---- Realtime state (server -> client) ----
 
-export type ParticipantView = { id: string; nickname: string; role: Role; online: boolean; hasVoted: boolean };
+export type ParticipantView = {
+  id: string;
+  nickname: string;
+  role: Role;
+  online: boolean;
+  hasVoted: boolean;
+  /** Granted the right to reveal votes one by one (facilitators always can). */
+  canReveal: boolean;
+  /** Observer waiting for approval to vote. */
+  voteRequested: boolean;
+};
 
 export type ItemView = {
   id: string;
@@ -173,7 +214,14 @@ export type RoomState = {
     persistent: boolean;
     currentItemId: string | null;
   };
-  me: { participantId: string; nickname: string; role: Role };
+  me: {
+    participantId: string;
+    nickname: string;
+    role: Role;
+    voteRequested: boolean;
+    /** What the viewer may do, resolved on the server from role, grants and room settings. */
+    can: Record<PermissionKey, boolean> & { vote: boolean; manageRoom: boolean };
+  };
   participants: ParticipantView[];
   items: ItemView[];
   round: RoundView | null;

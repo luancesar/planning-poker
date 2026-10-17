@@ -2,7 +2,7 @@ import type { Server, Socket } from 'socket.io';
 import { ActionSchema, SOCKET_EVENTS, type ActionAck } from '../shared/protocol';
 import type { Db } from './db/client';
 import { ActionError } from './errors';
-import { applyAction, authenticate, maybeAutoReveal, touchPresence, withRoomLock } from './room-service';
+import { applyAction, authenticate, touchPresence, withRoomLock } from './room-service';
 import { loadRoomBase, viewFor } from './snapshot';
 
 type SocketData = { participantId: string; roomId: string };
@@ -102,16 +102,8 @@ export function setupRealtime(io: Server, db: Db) {
       broadcaster.schedule(roomId);
     });
 
-    socket.on('disconnect', async () => {
-      try {
-        // Someone who had not voted may have left, which can complete the round.
-        const online = await onlineIds(io, roomId);
-        await withRoomLock(db, roomId, (tx, room) => maybeAutoReveal(tx, room, online));
-      } catch (e) {
-        if (!(e instanceof ActionError)) console.error('[disconnect]', e);
-      }
-      broadcaster.schedule(roomId);
-    });
+    // Presence changed: everyone else needs a fresh snapshot.
+    socket.on('disconnect', () => broadcaster.schedule(roomId));
 
     try {
       await touchPresence(db, participantId, roomId);

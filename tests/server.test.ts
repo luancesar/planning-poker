@@ -84,11 +84,27 @@ describe('planning poker room', () => {
       api<JoinResponse>(`/api/rooms/${code.toLowerCase()}/join`, { method: 'POST', json: { nickname, role, password: 'segredo' } }).then((r) => r.body);
 
     fac = await client(created.body);
-    ana = await client(await join('Ana'));
+    const anaJoin = await join('Ana');
+    expect(anaJoin.pending).toBe(true);
+    ana = await client(anaJoin);
     bia = await client(await join('Bia'));
     obs = await client(await join('Olga', 'observer'));
     const s = await fac.until((s) => s.participants.filter((p) => p.online).length === 4);
     expect(s.me.role).toBe('facilitator');
+    expect(s.me.can).toEqual({ reveal: true, rounds: true, items: true, vote: true, manageRoom: true });
+  });
+
+  it('keeps would-be voters as observers until a facilitator approves them', async () => {
+    expect(ana.state.me).toMatchObject({ role: 'observer', voteRequested: true });
+    expect(ana.state.me.can.vote).toBe(false);
+    expect(obs.state.me.voteRequested).toBe(false);
+
+    const ids = [ana.state.me.participantId, bia.state.me.participantId];
+    expect(await bia.send({ type: 'participant.reviewVote', participantIds: ids, approve: true })).toMatchObject({ ok: false });
+    expect(await fac.send({ type: 'participant.reviewVote', participantIds: ids, approve: true })).toEqual({ ok: true });
+    const s = await ana.until((s) => s.me.role === 'voter');
+    expect(s.me).toMatchObject({ voteRequested: false, can: { vote: true, reveal: false, rounds: false, items: false, manageRoom: false } });
+    await bia.until((s) => s.me.role === 'voter');
   });
 
   it('rejects sockets with a bad token', async () => {
@@ -105,7 +121,7 @@ describe('planning poker room', () => {
     expect(s.items.map((i) => i.title)).toEqual(['Login', 'Checkout', 'Busca']);
   });
 
-  it('hides votes until every voter has voted, then auto-reveals', async () => {
+  it('keeps votes hidden until someone with permission reveals them', async () => {
     const [login] = fac.state.items;
     expect(await fac.send({ type: 'round.start', itemId: login.id })).toEqual({ ok: true });
     await ana.until((s) => s.round?.itemId === login.id);
@@ -120,8 +136,16 @@ describe('planning poker room', () => {
     expect((await ana.until((s) => s.round?.myVote === '5')).round!.votes[0].label).toBe('5');
 
     await bia.send({ type: 'vote.cast', label: '8' });
-    expect(fac.state.round?.revealedAt).toBeFalsy();
     await fac.send({ type: 'vote.cast', label: '5' });
+    const allVoted = await fac.until((s) => s.participants.filter((p) => p.hasVoted).length === 3);
+    expect(allVoted.round!.revealedAt).toBeNull(); // no auto-reveal, even with everyone voted
+
+    expect(await ana.send({ type: 'round.reveal' })).toMatchObject({ ok: false, error: expect.stringContaining('revelar') });
+    expect(await ana.send({ type: 'participant.setCanReveal', participantId: bia.state.me.participantId, canReveal: true })).toMatchObject({ ok: false });
+    await fac.send({ type: 'participant.setCanReveal', participantId: bia.state.me.participantId, canReveal: true });
+    await bia.until((s) => s.me.can.reveal);
+    expect((await ana.until((s) => !!s.participants.find((p) => p.nickname === 'Bia')?.canReveal)).me.can.reveal).toBe(false);
+    expect(await bia.send({ type: 'round.reveal' })).toEqual({ ok: true });
 
     const revealed = await obs.until((s) => !!s.round?.revealedAt);
     expect(revealed.round!.votes.map((v) => v.label).sort()).toEqual(['5', '5', '8']);
@@ -160,19 +184,52 @@ describe('planning poker room', () => {
     expect(s.items[1].status).toBe('voting');
   });
 
-  it('reveals rounds whose timer ran out', async () => {
+  it('closes voting when the timer runs out but keeps votes hidden', async () => {
     const roundId = fac.state.round!.id;
     await ana.send({ type: 'vote.cast', label: '3' });
     const { eq } = await import('drizzle-orm');
     await app.db.update(rounds).set({ endsAt: new Date(Date.now() - 1000) }).where(eq(rounds.id, roundId));
-    const s = await bia.until((s) => s.round?.id === roundId && !!s.round.revealedAt, 5000);
+
+    expect(await bia.send({ type: 'vote.cast', label: '5' })).toMatchObject({ ok: false, error: expect.stringContaining('tempo') });
+    expect(await ana.send({ type: 'vote.retract' })).toMatchObject({ ok: false });
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(bia.state.round).toMatchObject({ id: roundId, revealedAt: null, stats: null });
+
+    await fac.send({ type: 'round.reveal' });
+    const s = await bia.until((s) => s.round?.id === roundId && !!s.round.revealedAt);
     expect(s.round!.stats?.counted).toBe(1);
+  });
+
+  it('lets facilitators open actions to voters, per group of actions', async () => {
+    expect(await ana.send({ type: 'round.start', itemId: fac.state.items[2].id })).toMatchObject({ ok: false, error: expect.stringContaining('rodadas') });
+    expect(await ana.send({ type: 'room.update', settings: { permissions: { items: 'voters' } } })).toMatchObject({ ok: false });
+
+    await fac.send({ type: 'room.update', settings: { permissions: { items: 'voters', rounds: 'voters' } } });
+    const s = await ana.until((s) => s.me.can.items && s.me.can.rounds);
+    expect(s.room.settings.permissions).toEqual({ reveal: 'facilitators', rounds: 'voters', items: 'voters' });
+    expect(s.me.can.reveal).toBe(false);
+
+    expect(await ana.send({ type: 'item.add', items: [{ title: 'Relatórios' }] })).toEqual({ ok: true });
+    expect(await obs.send({ type: 'item.add', items: [{ title: 'Observador não' }] })).toMatchObject({ ok: false });
+    await fac.send({ type: 'room.update', settings: { permissions: { items: 'facilitators', rounds: 'facilitators' } } });
+    await ana.until((s) => !s.me.can.items && s.items.length === 4);
+  });
+
+  it('lets observers ask to vote and approves pending requests when approval is turned off', async () => {
+    expect(await obs.send({ type: 'participant.requestVote' })).toEqual({ ok: true });
+    await fac.until((s) => !!s.participants.find((p) => p.nickname === 'Olga')?.voteRequested);
+    await fac.send({ type: 'room.update', settings: { requireApproval: false } });
+    const s = await obs.until((s) => s.me.role === 'voter');
+    expect(s.me.voteRequested).toBe(false);
+    expect(await ana.send({ type: 'participant.requestVote' })).toMatchObject({ ok: false });
+    await fac.send({ type: 'participant.setRole', participantId: obs.state.me.participantId, role: 'observer' });
+    await obs.until((s) => s.me.role === 'observer');
   });
 
   it('reorders items and keeps at least one facilitator', async () => {
     const busca = fac.state.items[2];
     await fac.send({ type: 'item.move', itemId: busca.id, toIndex: 0 });
-    expect((await ana.until((s) => s.items[0].id === busca.id)).items.map((i) => i.title)).toEqual(['Busca', 'Login', 'Checkout']);
+    expect((await ana.until((s) => s.items[0].id === busca.id)).items.map((i) => i.title)).toEqual(['Busca', 'Login', 'Checkout', 'Relatórios']);
     expect(await fac.send({ type: 'participant.setRole', participantId: fac.state.me.participantId, role: 'voter' })).toMatchObject({ ok: false });
   });
 

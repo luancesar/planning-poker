@@ -37,6 +37,11 @@ await bia.goto(`${base}/r/${code}`);
 await bia.getByLabel('Seu apelido').fill('Bia');
 await bia.getByRole('button', { name: 'Entrar na sala' }).click();
 await fac.getByText('3 online').waitFor();
+await ana.getByText('Aguardando um facilitador liberar seu voto').waitFor();
+await fac.getByText('2 pessoas pediram para votar').waitFor();
+await fac.screenshot({ path: `${out}/2a-approval.png` });
+await fac.getByRole('button', { name: 'Aprovar todos' }).click();
+await ana.getByText('Aguardando um facilitador liberar seu voto').waitFor({ state: 'hidden' });
 
 await fac.getByRole('button', { name: 'Votar', exact: true }).first().click();
 await ana.getByText('Votaram 0 de 3').waitFor();
@@ -46,6 +51,9 @@ await bia.getByRole('group', { name: 'Seu voto' }).getByRole('button', { name: '
 await fac.getByText('Votaram 2 de 3').waitFor();
 await fac.screenshot({ path: `${out}/2-voting-hidden.png` });
 await fac.getByRole('group', { name: 'Seu voto' }).getByRole('button', { name: '3', exact: true }).click();
+await fac.getByText('Votaram 3 de 3').waitFor();
+if (await ana.getByRole('button', { name: 'Revelar votos' }).count()) throw new Error('voter should not see the reveal button');
+await fac.getByRole('button', { name: 'Revelar votos' }).click();
 await fac.getByText('Votos revelados').waitFor();
 await ana.getByText('Divergência: ouçam os extremos').waitFor();
 

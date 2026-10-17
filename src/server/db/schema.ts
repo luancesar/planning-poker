@@ -35,6 +35,10 @@ export const participants = pgTable(
     nickname: text('nickname').notNull(),
     role: roleEnum('role').notNull(),
     tokenHash: text('token_hash').notNull(),
+    /** Granted by a facilitator: may reveal votes regardless of the room's reveal setting. */
+    canReveal: boolean('can_reveal').notNull().default(false),
+    /** Observer asking to vote; waits for a facilitator's approval. */
+    voteRequested: boolean('vote_requested').notNull().default(false),
     removedAt: timestamp('removed_at', { withTimezone: true }),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
     createdAt: createdAt(),

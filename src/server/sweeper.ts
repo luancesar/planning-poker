@@ -1,29 +1,12 @@
 import type { Db } from './db/client';
-import type { Broadcaster } from './realtime';
-import { deleteExpiredRooms, expiredRounds, revealExpired } from './room-service';
+import { deleteExpiredRooms } from './room-service';
 
 /**
- * Reveals rounds whose timer ran out and deletes rooms that expired from inactivity.
- * It only touches the database while someone is connected, so a serverless
- * Postgres (e.g. Neon free tier) can suspend when nobody is using the app.
+ * Deletes rooms that expired from inactivity. It only touches the database while
+ * someone is connected, so a serverless Postgres (e.g. Neon free tier) can
+ * suspend when nobody is using the app.
  */
-export function startSweeper(db: Db, broadcaster: Broadcaster, hasClients: () => boolean) {
-  let busy = false;
-  const timers = setInterval(async () => {
-    if (busy || !hasClients()) return;
-    busy = true;
-    try {
-      for (const { roomId, roundId } of await expiredRounds(db)) {
-        await revealExpired(db, roomId, roundId);
-        broadcaster.schedule(roomId);
-      }
-    } catch (e) {
-      console.error('[sweeper:timers]', e);
-    } finally {
-      busy = false;
-    }
-  }, 1000);
-
+export function startSweeper(db: Db, hasClients: () => boolean) {
   const cleanup = setInterval(async () => {
     if (!hasClients()) return;
     try {
@@ -36,7 +19,6 @@ export function startSweeper(db: Db, broadcaster: Broadcaster, hasClients: () =>
 
   return {
     stop() {
-      clearInterval(timers);
       clearInterval(cleanup);
     },
   };

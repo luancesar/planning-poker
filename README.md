@@ -7,10 +7,11 @@ SaaS de Planning Poker: o time entra numa sala pelo link ou por um código de 6 
 - **Salas**: criar com nome, deck e opções; entrar como convidado só com apelido; senha opcional; sala persistente (expira após 90 dias sem uso) ou temporária (24 h); limite de 50 participantes.
 - **Decks**: Fibonacci, Fibonacci modificado, T-shirt, potências de 2 e personalizado (até 20 cards). `?` e `☕` não entram na média.
 - **Itens**: adicionar um a um, colar uma lista, importar CSV (título, descrição, link); editar, excluir, reordenar arrastando, pular e reabrir.
-- **Votação em tempo real**: o servidor é a fonte da verdade e nunca envia o valor de um voto antes da revelação. Revelação manual, automática (todos os votantes online votaram) ou por timer (30 s a 5 min); revotar; estimativa final com sugestão automática; "salvar e próximo".
+- **Votação em tempo real**: o servidor é a fonte da verdade e nunca envia o valor de um voto antes da revelação. A revelação é sempre manual, feita por quem tem permissão. O timer opcional (30 s a 5 min) só encerra a votação, e os votos continuam ocultos. Dá para revotar, definir a estimativa final com sugestão automática e usar "salvar e próximo".
+- **Permissões**: com "Aprovar quem vota" (padrão nas salas novas), quem entra como votante fica como observador até um facilitador aprovar; dá para aprovar ou recusar um a um ou todos. Observadores podem pedir para votar. O facilitador pode dar a pessoas específicas a permissão de revelar votos. Nas configurações da sala, cada grupo de ações (revelar, controlar rodadas, gerenciar itens) fica liberado só para facilitadores ou também para votantes.
 - **Resultados**: distribuição, média, mediana, moda e indicador de consenso; na divergência, sugere quem deve explicar primeiro (os extremos).
 - **Comentários**: por item, em tempo real, com respostas, @menções, reações, edição/exclusão, voto anexado ("votou 13") e fixar como decisão.
-- **Papéis**: facilitador, votante e observador; promover, rebaixar e remover participantes (a sala sempre mantém um facilitador).
+- **Papéis**: facilitador, votante e observador; promover, rebaixar e remover participantes (a sala sempre mantém um facilitador). Gerenciar participantes, aprovar votos e mudar configurações é sempre exclusivo de facilitadores.
 - **Histórico**: resumo da sessão imprimível em PDF (`/r/CODIGO/resumo`) e export CSV (abre em pt-BR no Excel).
 - **Interface** responsiva (abas no celular), modo claro/escuro automático, pt-BR.
 
@@ -31,8 +32,8 @@ navegador ──HTTP──▶ Next.js (páginas)      ┐
 
 - Cada ação da sala roda numa transação que trava a linha da sala (`SELECT ... FOR UPDATE`), então funciona igual com várias instâncias. Para escalar horizontalmente, defina `REDIS_URL` (adapter do Socket.IO); com uma instância, Redis não é necessário.
 - Depois de cada mudança, o servidor envia um snapshot da sala para cada participante, montado para quem vai recebê-lo (cada pessoa vê o próprio voto, os dos outros ficam ocultos). Na reconexão, o cliente recebe o estado completo e nada se perde.
-- Feito para banco distante (ex.: app em Virginia, banco em São Paulo): a ação abre a transação, trava a sala e lê o contexto numa só ida ao banco, o voto é gravado junto com a checagem de auto-revelação, e o snapshot faz suas leituras em paralelo. Com ~120 ms de latência até o banco, um voto aparece para os outros em ~0,5 s (antes: 2,2 s). Para medir: `node scripts/latency-proxy.mjs 6543 localhost:5432 60` e `DATABASE_URL=postgres://postgres:postgres@localhost:6543/poker npx tsx scripts/bench-latency.ts`.
-- O timer e a limpeza de salas expiradas só consultam o banco enquanto há alguém conectado, para o Postgres serverless (Neon) poder hibernar. Abas escondidas por mais de 30 minutos se desconectam e voltam sozinhas quando a pessoa retorna.
+- Feito para banco distante (ex.: app em Virginia, banco em São Paulo): a ação abre a transação, trava a sala e lê o contexto numa só ida ao banco, e o snapshot faz suas leituras em paralelo. Com ~120 ms de latência até o banco, um voto aparece para os outros em ~0,5 s (antes: 2,2 s). Para medir: `node scripts/latency-proxy.mjs 6543 localhost:5432 60` e `DATABASE_URL=postgres://postgres:postgres@localhost:6543/poker npx tsx scripts/bench-latency.ts`.
+- A limpeza de salas expiradas só consulta o banco enquanto há alguém conectado, para o Postgres serverless (Neon) poder hibernar. Abas escondidas por mais de 30 minutos se desconectam e voltam sozinhas quando a pessoa retorna.
 
 | Pasta | Conteúdo |
 | --- | --- |

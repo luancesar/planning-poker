@@ -9,13 +9,20 @@ type Run = (action: Action) => Promise<boolean>;
 
 const ROLE_LABEL: Record<Role, string> = { facilitator: 'Facilitador', voter: 'Votante', observer: 'Observador' };
 
-function Countdown({ endsAt, clockOffset }: { endsAt: number; clockOffset: number }) {
+/** Seconds left on the round timer (server clock), ticking; null without a timer. */
+function useSecondsLeft(endsAt: number | null | undefined, clockOffset: number) {
   const [now, setNow] = useState(() => Date.now() + clockOffset);
   useEffect(() => {
+    if (!endsAt) return;
+    setNow(Date.now() + clockOffset);
     const t = setInterval(() => setNow(Date.now() + clockOffset), 250);
     return () => clearInterval(t);
-  }, [clockOffset]);
-  const left = Math.max(0, Math.ceil((endsAt - now) / 1000));
+  }, [endsAt, clockOffset]);
+  return endsAt ? Math.max(0, Math.ceil((endsAt - now) / 1000)) : null;
+}
+
+function Countdown({ left }: { left: number }) {
+  if (left === 0) return <Badge tone="bad">⏱ Tempo esgotado</Badge>;
   return (
     <Badge tone={left <= 10 ? 'bad' : 'accent'} className="font-mono tabular-nums">
       ⏱ {Math.floor(left / 60)}:{String(left % 60).padStart(2, '0')}
@@ -23,12 +30,56 @@ function Countdown({ endsAt, clockOffset }: { endsAt: number; clockOffset: numbe
   );
 }
 
+/** Facilitators see who is waiting to vote and approve them in one click. */
+function ApprovalRequests({ state, run }: { state: RoomState; run: Run }) {
+  const pending = state.participants.filter((p) => p.voteRequested);
+  if (!state.me.can.manageRoom || pending.length === 0) return null;
+  const ids = pending.map((p) => p.id);
+  return (
+    <Panel className="flex flex-col gap-3 border-warn/40 bg-warn-soft/40 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold">
+          {pending.length === 1 ? '1 pessoa pediu para votar' : `${pending.length} pessoas pediram para votar`}
+        </h3>
+        {pending.length > 1 && (
+          <div className="flex gap-2">
+            <Button size="sm" variant="primary" onClick={() => run({ type: 'participant.reviewVote', participantIds: ids, approve: true })}>
+              Aprovar todos
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => run({ type: 'participant.reviewVote', participantIds: ids, approve: false })}>
+              Recusar todos
+            </Button>
+          </div>
+        )}
+      </div>
+      <ul className="flex flex-col gap-2">
+        {pending.map((p) => (
+          <li key={p.id} className="flex items-center justify-between gap-2 text-sm">
+            <span className="flex min-w-0 items-center gap-2">
+              <span className={cx('size-1.5 shrink-0 rounded-full', p.online ? 'bg-good' : 'bg-muted')} />
+              <span className="truncate">{p.nickname}</span>
+            </span>
+            <span className="flex shrink-0 gap-1">
+              <Button size="sm" onClick={() => run({ type: 'participant.reviewVote', participantIds: [p.id], approve: true })}>
+                Aprovar
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => run({ type: 'participant.reviewVote', participantIds: [p.id], approve: false })}>
+                Recusar
+              </Button>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </Panel>
+  );
+}
+
 function Seat({ person, state, run }: { person: ParticipantView; state: RoomState; run: Run }) {
   const { round, me } = state;
   const vote = round?.votes.find((v) => v.participantId === person.id);
   const revealed = !!round?.revealedAt;
-  const isFacilitator = me.role === 'facilitator';
   const isMe = person.id === me.participantId;
+  const note = person.voteRequested ? 'aguardando' : person.canReveal && person.role !== 'facilitator' ? 'pode revelar' : null;
 
   let card;
   if (person.role === 'observer') {
@@ -66,12 +117,20 @@ function Seat({ person, state, run }: { person: ParticipantView; state: RoomStat
           {person.nickname}
         </span>
       </div>
-      {isFacilitator && !isMe && (
+      {note && <span className={cx('-mt-1 text-[11px]', person.voteRequested ? 'text-warn' : 'text-muted')}>{note}</span>}
+      {me.can.manageRoom && !isMe && (
         <div className="-mt-1">
           <Menu
             label={`Opções de ${person.nickname}`}
             align="left"
             items={[
+              { label: 'Aprovar voto', hidden: !person.voteRequested, onSelect: () => run({ type: 'participant.reviewVote', participantIds: [person.id], approve: true }) },
+              { label: 'Recusar pedido', hidden: !person.voteRequested, onSelect: () => run({ type: 'participant.reviewVote', participantIds: [person.id], approve: false }) },
+              {
+                label: person.canReveal ? 'Remover permissão de revelar' : 'Permitir revelar votos',
+                hidden: person.role === 'facilitator',
+                onSelect: () => run({ type: 'participant.setCanReveal', participantId: person.id, canReveal: !person.canReveal }),
+              },
               { label: 'Tornar facilitador', hidden: person.role === 'facilitator', onSelect: () => run({ type: 'participant.setRole', participantId: person.id, role: 'facilitator' }) },
               { label: 'Tornar votante', hidden: person.role === 'voter', onSelect: () => run({ type: 'participant.setRole', participantId: person.id, role: 'voter' }) },
               { label: 'Tornar observador', hidden: person.role === 'observer', onSelect: () => run({ type: 'participant.setRole', participantId: person.id, role: 'observer' }) },
@@ -186,13 +245,23 @@ function FinalizeControls({ state, run, itemId }: { state: RoomState; run: Run; 
   );
 }
 
-function CardDeck({ state, run }: { state: RoomState; run: Run }) {
+function CardDeck({ state, run, timeUp }: { state: RoomState; run: Run; timeUp: boolean }) {
   const { round, room, me } = state;
-  const canVote = me.role === 'voter' || (me.role === 'facilitator' && room.settings.facilitatorVotes);
-  if (!canVote) {
-    return <p className="text-center text-sm text-muted">{me.role === 'observer' ? 'Você está como observador.' : 'O facilitador não vota nesta sala.'}</p>;
+  if (!me.can.vote) {
+    if (me.role !== 'observer') return <p className="text-center text-sm text-muted">O facilitador não vota nesta sala.</p>;
+    if (me.voteRequested) {
+      return <p className="text-center text-sm text-warn">Pedido enviado. Aguardando um facilitador liberar seu voto.</p>;
+    }
+    return (
+      <div className="flex flex-col items-center gap-2 text-center text-sm text-muted">
+        <span>Você está como observador.</span>
+        <Button size="sm" onClick={() => run({ type: 'participant.requestVote' })}>
+          {room.settings.requireApproval ? 'Pedir para votar' : 'Quero votar'}
+        </Button>
+      </div>
+    );
   }
-  const open = !!round && !round.revealedAt;
+  const open = !!round && !round.revealedAt && !timeUp;
   return (
     <div className="flex flex-col items-center gap-2">
       <div className="flex flex-wrap justify-center gap-2" role="group" aria-label="Seu voto">
@@ -217,7 +286,13 @@ function CardDeck({ state, run }: { state: RoomState; run: Run }) {
         })}
       </div>
       <p className="text-xs text-muted">
-        {open ? (round?.myVote ? 'Clique no mesmo card para retirar o voto. Você pode trocar até a revelação.' : 'Escolha um card.') : 'Aguardando a próxima rodada.'}
+        {open
+          ? round?.myVote
+            ? 'Clique no mesmo card para retirar o voto. Você pode trocar até a revelação.'
+            : 'Escolha um card.'
+          : round && !round.revealedAt
+            ? 'Tempo esgotado. Os votos aparecem quando alguém com permissão revelar.'
+            : 'Aguardando a próxima rodada.'}
       </p>
     </div>
   );
@@ -226,14 +301,18 @@ function CardDeck({ state, run }: { state: RoomState; run: Run }) {
 export function VotingArea({ state, run, clockOffset }: { state: RoomState; run: Run; clockOffset: number }) {
   const { room, round, items, participants, me } = state;
   const item = items.find((i) => i.id === room.currentItemId);
-  const isFacilitator = me.role === 'facilitator';
-  const open = !!round && !round.revealedAt;
+  const { can } = me;
+  const hidden = !!round && !round.revealedAt;
+  const secondsLeft = useSecondsLeft(hidden ? round?.endsAt : null, clockOffset);
+  const timeUp = secondsLeft === 0;
+  const open = hidden && !timeUp;
   const voters = participants.filter((p) => p.role !== 'observer' && (p.role !== 'facilitator' || room.settings.facilitatorVotes));
   const votedCount = voters.filter((p) => p.hasVoted).length;
   const ordered = [...participants].sort((a, b) => Number(a.role === 'observer') - Number(b.role === 'observer'));
 
   return (
     <div className="flex flex-col gap-4">
+      <ApprovalRequests state={state} run={run} />
       <Panel className="p-5">
         {!item ? (
           <div className="flex flex-col items-center gap-2 py-6 text-center">
@@ -241,7 +320,7 @@ export function VotingArea({ state, run, clockOffset }: { state: RoomState; run:
               {items.length && items.every((i) => i.status === 'estimated' || i.status === 'skipped') ? 'Todos os itens foram estimados 🎉' : 'Nenhum item em votação'}
             </h2>
             <p className="max-w-sm text-sm text-muted">
-              {isFacilitator ? 'Adicione itens na lista e clique em “Votar” para abrir uma rodada.' : 'Aguardando o facilitador escolher o próximo item.'}
+              {can.rounds ? 'Adicione itens na lista e clique em “Votar” para abrir uma rodada.' : 'Aguardando o facilitador escolher o próximo item.'}
             </p>
           </div>
         ) : (
@@ -252,7 +331,7 @@ export function VotingArea({ state, run, clockOffset }: { state: RoomState; run:
               </span>
               {round && <Badge>Rodada {round.number}</Badge>}
               {item.finalEstimate && <Badge tone="good">Estimativa final: {item.finalEstimate}</Badge>}
-              {open && round?.endsAt && <Countdown endsAt={round.endsAt} clockOffset={clockOffset} />}
+              {secondsLeft !== null && <Countdown left={secondsLeft} />}
             </div>
             <h2 className="text-xl font-semibold leading-snug break-words">{item.title}</h2>
             {item.description && <p className="max-h-40 overflow-y-auto text-sm whitespace-pre-wrap text-muted">{item.description}</p>}
@@ -268,29 +347,34 @@ export function VotingArea({ state, run, clockOffset }: { state: RoomState; run:
       <Panel className="flex flex-col gap-5 p-5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-sm font-semibold">
-            {open ? `Votaram ${votedCount} de ${voters.length}` : round?.revealedAt ? 'Votos revelados' : 'Participantes'}
+            {hidden
+              ? `${timeUp ? 'Votação encerrada · ' : ''}Votaram ${votedCount} de ${voters.length}`
+              : round?.revealedAt
+                ? 'Votos revelados'
+                : 'Participantes'}
           </h3>
-          {isFacilitator && item && (
+          {item && (can.reveal || can.rounds) && (
             <div className="flex flex-wrap gap-2">
-              {open ? (
-                <>
-                  <Button variant="primary" size="sm" onClick={() => run({ type: 'round.reveal' })}>
-                    Revelar votos
-                  </Button>
-                  <Button size="sm" onClick={() => run({ type: 'round.reset' })}>
-                    Reiniciar
-                  </Button>
-                </>
-              ) : (
-                !round && (
-                  <Button variant="primary" size="sm" onClick={() => run({ type: 'round.start', itemId: item.id })}>
-                    Iniciar votação
-                  </Button>
-                )
+              {hidden && can.reveal && (
+                <Button variant="primary" size="sm" onClick={() => run({ type: 'round.reveal' })}>
+                  Revelar votos
+                </Button>
               )}
-              <Button variant="ghost" size="sm" onClick={() => run({ type: 'item.skip', itemId: item.id })}>
-                Pular item
-              </Button>
+              {hidden && can.rounds && (
+                <Button size="sm" onClick={() => run({ type: 'round.reset' })}>
+                  Reiniciar
+                </Button>
+              )}
+              {!round && can.rounds && (
+                <Button variant="primary" size="sm" onClick={() => run({ type: 'round.start', itemId: item.id })}>
+                  Iniciar votação
+                </Button>
+              )}
+              {can.rounds && (
+                <Button variant="ghost" size="sm" onClick={() => run({ type: 'item.skip', itemId: item.id })}>
+                  Pular item
+                </Button>
+              )}
             </div>
           )}
         </div>
@@ -300,17 +384,18 @@ export function VotingArea({ state, run, clockOffset }: { state: RoomState; run:
           ))}
         </ul>
         {round?.revealedAt && <Results state={state} />}
-        {isFacilitator && item && round?.revealedAt && <FinalizeControls state={state} run={run} itemId={item.id} />}
+        {can.rounds && item && round?.revealedAt && <FinalizeControls state={state} run={run} itemId={item.id} />}
       </Panel>
 
-      {item && (
+      {(item || me.role === 'observer') && (
+        // Observers always see their status (e.g. waiting for approval), even before the first round.
         // On phones the deck sticks to the bottom only while a round is open, so results stay readable afterwards.
         <div
           className={cx(
             open && 'sticky bottom-0 z-10 -mx-4 border-t border-line bg-bg/90 px-4 py-4 backdrop-blur sm:static sm:mx-0 sm:border-0 sm:bg-transparent sm:p-0 sm:backdrop-blur-none',
           )}
         >
-          <CardDeck state={state} run={run} />
+          <CardDeck state={state} run={run} timeUp={timeUp} />
         </div>
       )}
     </div>

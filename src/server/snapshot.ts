@@ -1,4 +1,5 @@
 import { and, asc, count, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { permissionsFor } from '../shared/permissions';
 import type { CommentView, ItemView, RoomState } from '../shared/protocol';
 import type { DbOrTx } from './db/client';
 import { comments, items, participants, reactions, rooms, rounds, votes } from './db/schema';
@@ -114,10 +115,24 @@ export function viewFor(base: RoomBase, participantId: string, online: Set<strin
       persistent: room.persistent,
       currentItemId: room.currentItemId,
     },
-    me: { participantId: me.id, nickname: me.nickname, role: me.role },
+    me: {
+      participantId: me.id,
+      nickname: me.nickname,
+      role: me.role,
+      voteRequested: me.voteRequested,
+      can: permissionsFor(me, room.settings),
+    },
     participants: people
       .filter((p) => !p.removedAt)
-      .map((p) => ({ id: p.id, nickname: p.nickname, role: p.role, online: online.has(p.id), hasVoted: voted.has(p.id) })),
+      .map((p) => ({
+        id: p.id,
+        nickname: p.nickname,
+        role: p.role,
+        online: online.has(p.id),
+        hasVoted: voted.has(p.id),
+        canReveal: p.canReveal,
+        voteRequested: p.voteRequested,
+      })),
     items,
     round: round
       ? {

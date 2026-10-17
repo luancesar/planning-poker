@@ -5,13 +5,24 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import { saveLastNickname } from '@/lib/session';
 import { useRoom } from '@/lib/useRoom';
-import type { Action, JoinResponse, RoomState } from '@/shared/protocol';
+import type { Action, JoinResponse, PermissionKey, PermissionLevel, RoomState } from '@/shared/protocol';
 import { CommentsPanel } from './CommentsPanel';
 import { ItemsPanel } from './ItemsPanel';
 import { Button, Field, Input, Menu, Modal, Select, Toggle, cx } from './ui';
 import { VotingArea } from './VotingArea';
 
 type Run = (action: Action) => Promise<boolean>;
+
+const LEVELS: [PermissionLevel, string][] = [
+  ['facilitators', 'Só facilitadores'],
+  ['voters', 'Facilitadores e votantes'],
+];
+
+const PERMISSION_FIELDS: [PermissionKey, string, string][] = [
+  ['reveal', 'Revelar votos', 'Você também pode liberar pessoas específicas no menu de cada participante.'],
+  ['rounds', 'Controlar rodadas', 'Iniciar, reiniciar e pular votação, e definir a estimativa final.'],
+  ['items', 'Gerenciar itens', 'Adicionar, editar, excluir, reordenar e reabrir itens.'],
+];
 
 function SettingsModal({ open, onClose, state, run }: { open: boolean; onClose: () => void; state: RoomState; run: Run }) {
   const [name, setName] = useState(state.room.name);
@@ -24,6 +35,7 @@ function SettingsModal({ open, onClose, state, run }: { open: boolean; onClose: 
     // Only reload the form when it opens, so remote updates do not wipe edits in progress.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+  const pending = state.participants.filter((p) => p.voteRequested).length;
   return (
     <Modal open={open} onClose={onClose} title="Configurações da sala">
       <form
@@ -36,9 +48,18 @@ function SettingsModal({ open, onClose, state, run }: { open: boolean; onClose: 
         <Field label="Nome da sala">
           <Input value={name} onChange={(e) => setName(e.target.value)} maxLength={80} required />
         </Field>
-        <Toggle checked={settings.autoReveal} onChange={(autoReveal) => setSettings({ ...settings, autoReveal })} label="Revelar automaticamente" hint="Quando todos os votantes online tiverem votado" />
+        <Toggle
+          checked={settings.requireApproval}
+          onChange={(requireApproval) => setSettings({ ...settings, requireApproval })}
+          label="Aprovar quem vota"
+          hint={
+            !settings.requireApproval && pending > 0 && state.room.settings.requireApproval
+              ? `Ao salvar, ${pending} ${pending === 1 ? 'pedido pendente será aprovado' : 'pedidos pendentes serão aprovados'}.`
+              : 'Quem entra fica como observador até um facilitador liberar o voto.'
+          }
+        />
         <Toggle checked={settings.facilitatorVotes} onChange={(facilitatorVotes) => setSettings({ ...settings, facilitatorVotes })} label="Facilitador também vota" />
-        <Field label="Timer por rodada" hint="Vale a partir da próxima rodada.">
+        <Field label="Timer por rodada" hint="Quando o tempo acaba a votação fecha; os votos só aparecem quando alguém revelar.">
           <Select
             value={settings.timerSeconds ?? ''}
             onChange={(e) => setSettings({ ...settings, timerSeconds: e.target.value ? Number(e.target.value) : null })}
@@ -51,6 +72,24 @@ function SettingsModal({ open, onClose, state, run }: { open: boolean; onClose: 
             <option value="300">5 minutos</option>
           </Select>
         </Field>
+        <fieldset className="flex flex-col gap-3 border-t border-line pt-4">
+          <legend className="pt-4 text-sm font-semibold">Permissões</legend>
+          {PERMISSION_FIELDS.map(([key, label, hint]) => (
+            <Field key={key} label={label} hint={hint}>
+              <Select
+                value={settings.permissions[key]}
+                onChange={(e) => setSettings({ ...settings, permissions: { ...settings.permissions, [key]: e.target.value as PermissionLevel } })}
+              >
+                {LEVELS.map(([value, text]) => (
+                  <option key={value} value={value}>
+                    {text}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          ))}
+          <p className="text-xs text-muted">Gerenciar participantes, aprovar votos e estas configurações continuam restritos a facilitadores.</p>
+        </fieldset>
         <Button type="submit" variant="primary">
           Salvar
         </Button>
@@ -134,7 +173,6 @@ export function RoomView({ session, onSessionLost }: { session: JoinResponse; on
   }
 
   const viewItemId = selectedItemId ?? currentItemId ?? state.items[0]?.id ?? null;
-  const isFacilitator = state.me.role === 'facilitator';
   const online = state.participants.filter((p) => p.online).length;
   const commentCount = state.comments.filter((c) => c.itemId === viewItemId).length;
 
@@ -186,7 +224,7 @@ export function RoomView({ session, onSessionLost }: { session: JoinResponse; on
             label="Menu da sala"
             trigger={<span className="max-w-28 truncate text-sm text-ink">{state.me.nickname} ▾</span>}
             items={[
-              { label: 'Configurações da sala', hidden: !isFacilitator, onSelect: () => setSettingsOpen(true) },
+              { label: 'Configurações da sala', hidden: !state.me.can.manageRoom, onSelect: () => setSettingsOpen(true) },
               { label: 'Resumo da sessão / PDF', onSelect: () => window.open(`/r/${state.room.code}/resumo`, '_blank') },
               { label: 'Exportar CSV', onSelect: () => api.downloadCsv(state.room.code, session.token).catch((e: Error) => showError(e.message)) },
               { label: 'Alterar apelido', onSelect: () => setRenameOpen(true) },

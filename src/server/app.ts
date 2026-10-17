@@ -38,8 +38,8 @@ export async function createAppServer({ databaseUrl, redisUrl, fallback }: Optio
     redisClients = [pub, sub];
   }
 
-  const broadcaster = setupRealtime(io, db);
-  const sweeper = startSweeper(db, broadcaster, () => io.engine.clientsCount > 0);
+  setupRealtime(io, db);
+  const sweeper = startSweeper(db, () => io.engine.clientsCount > 0);
 
   return {
     server,

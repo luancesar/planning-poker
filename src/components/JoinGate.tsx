@@ -72,7 +72,7 @@ export function JoinGate({ code, notice, onJoined }: { code: string; notice?: st
               <div className="grid grid-cols-2 gap-2">
                 {(
                   [
-                    ['voter', 'Votante', 'Vota e comenta'],
+                    ['voter', 'Votante', preview?.requireApproval ? 'Vota após aprovação do facilitador' : 'Vota e comenta'],
                     ['observer', 'Observador', 'Só acompanha e comenta'],
                   ] as const
                 ).map(([value, label, hint]) => (
