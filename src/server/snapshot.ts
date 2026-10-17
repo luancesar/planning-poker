@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, inArray, isNull } from 'drizzle-orm';
+import { and, asc, count, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { CommentView, ItemView, RoomState } from '../shared/protocol';
 import type { DbOrTx } from './db/client';
 import { comments, items, participants, reactions, rooms, rounds, votes } from './db/schema';
@@ -7,51 +7,55 @@ import { comments, items, participants, reactions, rooms, rounds, votes } from '
 export type RoomBase = NonNullable<Awaited<ReturnType<typeof loadRoomBase>>>;
 
 export async function loadRoomBase(db: DbOrTx, roomId: string) {
-  const [room] = await db.select().from(rooms).where(eq(rooms.id, roomId));
-  if (!room) return null;
-
-  const people = await db.select().from(participants).where(eq(participants.roomId, roomId)).orderBy(asc(participants.createdAt));
-
+  // Every query is independent (the current round is found through a subquery),
+  // so they run in parallel: one round trip to the database instead of seven.
+  const currentRound = db
+    .select({ id: rounds.id })
+    .from(rounds)
+    .where(eq(rounds.itemId, sql`(select ${rooms.currentItemId} from ${rooms} where ${rooms.id} = ${roomId})`))
+    .orderBy(desc(rounds.number))
+    .limit(1);
   const roundCounts = db
     .select({ itemId: rounds.itemId, n: count().as('n') })
     .from(rounds)
+    .innerJoin(items, eq(items.id, rounds.itemId))
+    .where(eq(items.roomId, roomId))
     .groupBy(rounds.itemId)
     .as('round_counts');
-  const itemRows = await db
-    .select({ item: items, roundCount: roundCounts.n })
-    .from(items)
-    .leftJoin(roundCounts, eq(roundCounts.itemId, items.id))
-    .where(eq(items.roomId, roomId))
-    .orderBy(asc(items.position));
 
-  let round: typeof rounds.$inferSelect | null = null;
-  let roundVotes: { participantId: string; label: string }[] = [];
-  if (room.currentItemId) {
-    [round] = await db.select().from(rounds).where(eq(rounds.itemId, room.currentItemId)).orderBy(desc(rounds.number)).limit(1);
-    round ??= null;
-    if (round) {
-      roundVotes = await db
-        .select({ participantId: votes.participantId, label: votes.cardLabel })
-        .from(votes)
-        .where(eq(votes.roundId, round.id))
-        .orderBy(asc(votes.createdAt));
-    }
-  }
+  const [[room], people, itemRows, [round], roundVotes, commentRows, reactionRows] = await Promise.all([
+    db.select().from(rooms).where(eq(rooms.id, roomId)),
+    db.select().from(participants).where(eq(participants.roomId, roomId)).orderBy(asc(participants.createdAt)),
+    db
+      .select({ item: items, roundCount: roundCounts.n })
+      .from(items)
+      .leftJoin(roundCounts, eq(roundCounts.itemId, items.id))
+      .where(eq(items.roomId, roomId))
+      .orderBy(asc(items.position)),
+    db.select().from(rounds).where(inArray(rounds.id, currentRound)),
+    db
+      .select({ participantId: votes.participantId, label: votes.cardLabel })
+      .from(votes)
+      .where(inArray(votes.roundId, currentRound))
+      .orderBy(asc(votes.createdAt)),
+    db
+      .select({ comment: comments })
+      .from(comments)
+      .innerJoin(items, eq(items.id, comments.itemId))
+      .where(and(eq(items.roomId, roomId), isNull(comments.deletedAt)))
+      .orderBy(asc(comments.createdAt))
+      .then((rows) => rows.map((r) => r.comment)),
+    db
+      .select({ reaction: reactions })
+      .from(reactions)
+      .innerJoin(comments, eq(comments.id, reactions.commentId))
+      .innerJoin(items, eq(items.id, comments.itemId))
+      .where(and(eq(items.roomId, roomId), isNull(comments.deletedAt)))
+      .then((rows) => rows.map((r) => r.reaction)),
+  ]);
+  if (!room) return null;
 
-  const itemIds = itemRows.map((r) => r.item.id);
-  const commentRows = itemIds.length
-    ? await db
-        .select()
-        .from(comments)
-        .where(and(inArray(comments.itemId, itemIds), isNull(comments.deletedAt)))
-        .orderBy(asc(comments.createdAt))
-    : [];
-  const commentIds = commentRows.map((c) => c.id);
-  const reactionRows = commentIds.length
-    ? await db.select().from(reactions).where(inArray(reactions.commentId, commentIds))
-    : [];
-
-  return { room, people, itemRows, round, roundVotes, commentRows, reactionRows };
+  return { room, people, itemRows, round: round ?? null, roundVotes, commentRows, reactionRows };
 }
 
 export function viewFor(base: RoomBase, participantId: string, online: Set<string>): RoomState | null {

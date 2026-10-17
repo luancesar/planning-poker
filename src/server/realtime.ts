@@ -2,7 +2,7 @@ import type { Server, Socket } from 'socket.io';
 import { ActionSchema, SOCKET_EVENTS, type ActionAck } from '../shared/protocol';
 import type { Db } from './db/client';
 import { ActionError } from './errors';
-import { applyAction, authenticate, getActiveParticipant, maybeAutoReveal, touchPresence, withRoomLock } from './room-service';
+import { applyAction, authenticate, maybeAutoReveal, touchPresence, withRoomLock } from './room-service';
 import { loadRoomBase, viewFor } from './snapshot';
 
 type SocketData = { participantId: string; roomId: string };
@@ -84,11 +84,15 @@ export function setupRealtime(io: Server, db: Db) {
       if (!parsed.success) return reply({ ok: false, error: parsed.error.issues[0]?.message ?? 'Ação inválida' });
       try {
         const online = await onlineIds(io, roomId);
-        const result = await withRoomLock(db, roomId, async (tx, room) => {
-          const actor = await getActiveParticipant(tx, roomId, participantId);
-          if (!actor) throw new ActionError('Você não está mais nesta sala', 403);
-          return applyAction(tx, room, actor, parsed.data, { online });
-        });
+        const result = await withRoomLock(
+          db,
+          roomId,
+          (tx, room, { actor }) => {
+            if (!actor) throw new ActionError('Você não está mais nesta sala', 403);
+            return applyAction(tx, room, actor, parsed.data, { online });
+          },
+          { actorId: participantId },
+        );
         reply({ ok: true });
         if (result.removedParticipantId) await kick(io, roomId, result.removedParticipantId);
       } catch (e) {

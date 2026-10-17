@@ -29,8 +29,9 @@ navegador ──HTTP──▶ Next.js (páginas)      ┐
                         PostgreSQL (Drizzle ORM, migrations automáticas no start)
 ```
 
-- Cada ação da sala roda numa transação com `pg_advisory_xact_lock`, então funciona igual com várias instâncias. Para escalar horizontalmente, defina `REDIS_URL` (adapter do Socket.IO); com uma instância, Redis não é necessário.
+- Cada ação da sala roda numa transação que trava a linha da sala (`SELECT ... FOR UPDATE`), então funciona igual com várias instâncias. Para escalar horizontalmente, defina `REDIS_URL` (adapter do Socket.IO); com uma instância, Redis não é necessário.
 - Depois de cada mudança, o servidor envia um snapshot da sala para cada participante, montado para quem vai recebê-lo (cada pessoa vê o próprio voto, os dos outros ficam ocultos). Na reconexão, o cliente recebe o estado completo e nada se perde.
+- Feito para banco distante (ex.: app em Virginia, banco em São Paulo): a ação abre a transação, trava a sala e lê o contexto numa só ida ao banco, o voto é gravado junto com a checagem de auto-revelação, e o snapshot faz suas leituras em paralelo. Com ~120 ms de latência até o banco, um voto aparece para os outros em ~0,5 s (antes: 2,2 s). Para medir: `node scripts/latency-proxy.mjs 6543 localhost:5432 60` e `DATABASE_URL=postgres://postgres:postgres@localhost:6543/poker npx tsx scripts/bench-latency.ts`.
 - O timer e a limpeza de salas expiradas só consultam o banco enquanto há alguém conectado, para o Postgres serverless (Neon) poder hibernar. Abas escondidas por mais de 30 minutos se desconectam e voltam sozinhas quando a pessoa retorna.
 
 | Pasta | Conteúdo |

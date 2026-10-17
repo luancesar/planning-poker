@@ -1,4 +1,5 @@
-import { and, asc, count, desc, eq, isNull, max, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, isNull, max, or, sql } from 'drizzle-orm';
+import type pg from 'pg';
 import { resolveDeck } from '../shared/decks';
 import {
   CreateRoomSchema,
@@ -12,7 +13,7 @@ import {
 } from '../shared/protocol';
 import { computeStats } from '../shared/stats';
 import { hashPassword, hashToken, newRoomCode, newToken, normalizeCode, verifyPassword } from './auth';
-import type { Db, DbOrTx, Tx } from './db/client';
+import { connOn, type Db, type DbOrTx, type Tx } from './db/client';
 import { comments, items, participants, reactions, rooms, rounds, votes } from './db/schema';
 import { ActionError } from './errors';
 
@@ -108,11 +109,13 @@ export async function authenticate(db: DbOrTx, token: string) {
 }
 
 export async function touchPresence(db: Db, participantId: string, roomId: string) {
-  await db.update(participants).set({ lastSeenAt: new Date() }).where(eq(participants.id, participantId));
-  await db
-    .update(rooms)
-    .set({ expiresAt: sql`now() + case when ${rooms.persistent} then interval '90 days' else interval '1 day' end` })
-    .where(eq(rooms.id, roomId));
+  await Promise.all([
+    db.update(participants).set({ lastSeenAt: new Date() }).where(eq(participants.id, participantId)),
+    db
+      .update(rooms)
+      .set({ expiresAt: sql`now() + case when ${rooms.persistent} then interval '90 days' else interval '1 day' end` })
+      .where(eq(rooms.id, roomId)),
+  ]);
 }
 
 export async function getActiveParticipant(db: DbOrTx, roomId: string, participantId: string) {
@@ -124,21 +127,77 @@ export async function getActiveParticipant(db: DbOrTx, roomId: string, participa
 }
 
 /**
- * Runs a mutation with the room serialized across every server instance
- * (Postgres advisory lock) and bumps the room's sequence number.
+ * A room row locked for the current transaction, plus a cache of the latest
+ * round of its current item so one action never reads it twice.
  */
-export async function withRoomLock<T>(db: Db, roomId: string, fn: (tx: Tx, room: RoomRow) => Promise<T>): Promise<T> {
-  return db.transaction(async (tx) => {
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${roomId}))`);
-    const [room] = await tx.select().from(rooms).where(eq(rooms.id, roomId));
-    if (!room) throw new ActionError('Sala não encontrada', 404);
-    const result = await fn(tx, room);
-    await tx
-      .update(rooms)
-      .set({ seq: sql`${rooms.seq} + 1`, currentItemId: room.currentItemId, expiresAt: expiryFor(room.persistent) })
-      .where(eq(rooms.id, roomId));
+export type LockedRoom = RoomRow & { $round?: RoundRow | null; $roundFor?: string | null };
+
+export type LockContext = { actor: ParticipantRow | null };
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function uuidLiteral(id: string | null) {
+  if (id === null) return 'null';
+  if (!UUID.test(id)) throw new Error(`Invalid uuid: ${id}`);
+  return `'${id}'`;
+}
+
+const camel = (key: string) => key.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+function camelize<T>(row: Record<string, unknown> | undefined): T | null {
+  return row ? (Object.fromEntries(Object.entries(row).map(([k, v]) => [camel(k), v])) as T) : null;
+}
+
+/**
+ * Runs a mutation with the room row locked (SELECT ... FOR UPDATE, so it is
+ * serialized across every server instance) and bumps the room's sequence number.
+ *
+ * Built for a distant database: BEGIN, the lock, the actor and the current round
+ * travel in one round trip, and the final update travels with COMMIT. Only ids
+ * already validated as UUIDs are inlined, since multi-statement queries take no parameters.
+ */
+export async function withRoomLock<T>(
+  db: Db,
+  roomId: string,
+  fn: (tx: Tx, room: LockedRoom, ctx: LockContext) => Promise<T>,
+  opts: { actorId?: string } = {},
+): Promise<T> {
+  const room = uuidLiteral(roomId);
+  const statements = [
+    'begin',
+    `select * from rooms where id = ${room} for update`,
+    `select * from rounds where item_id = (select current_item_id from rooms where id = ${room}) order by number desc limit 1`,
+  ];
+  if (opts.actorId) {
+    statements.push(`select * from participants where id = ${uuidLiteral(opts.actorId)} and room_id = ${room} and removed_at is null`);
+  }
+
+  const client = await db.$client.connect();
+  let broken = false;
+  try {
+    const results = (await client.query(statements.join(';\n'))) as unknown as pg.QueryResult[];
+    const locked = camelize<LockedRoom>(results[1].rows[0]);
+    if (!locked) throw new ActionError('Sala não encontrada', 404);
+    locked.$round = camelize<RoundRow>(results[2].rows[0]);
+    locked.$roundFor = locked.currentItemId;
+    const actor = opts.actorId ? camelize<ParticipantRow>(results[3].rows[0]) : null;
+
+    const result = await fn(connOn(client), locked, { actor });
+
+    const interval = locked.persistent ? '90 days' : '1 day';
+    await client.query(
+      `update rooms set seq = seq + 1, current_item_id = ${uuidLiteral(locked.currentItemId)}, expires_at = now() + interval '${interval}' where id = ${room};\ncommit`,
+    );
     return result;
-  });
+  } catch (e) {
+    try {
+      await client.query('rollback');
+    } catch {
+      broken = true;
+    }
+    throw e;
+  } finally {
+    client.release(broken);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -150,60 +209,74 @@ async function latestRound(tx: DbOrTx, itemId: string): Promise<RoundRow | null>
   return r ?? null;
 }
 
-async function openRound(tx: DbOrTx, room: RoomRow) {
+/** Latest round of the current item if it is still open; served from the lock's cache when possible. */
+async function openRound(tx: DbOrTx, room: LockedRoom) {
   if (!room.currentItemId) return null;
-  const r = await latestRound(tx, room.currentItemId);
+  if (room.$round === undefined || room.$roundFor !== room.currentItemId) {
+    room.$round = await latestRound(tx, room.currentItemId);
+    room.$roundFor = room.currentItemId;
+  }
+  const r = room.$round;
   return r && !r.revealedAt ? r : null;
 }
 
-async function startRound(tx: Tx, room: RoomRow, itemId: string) {
-  if (room.currentItemId && room.currentItemId !== itemId) {
-    await tx
-      .update(items)
-      .set({ status: 'pending' })
-      .where(and(eq(items.id, room.currentItemId), eq(items.status, 'voting')));
-  }
-  const [{ last }] = await tx.select({ last: max(rounds.number) }).from(rounds).where(eq(rounds.itemId, itemId));
-  const timer = room.settings.timerSeconds;
-  await tx.insert(rounds).values({
-    itemId,
-    number: (last ?? 0) + 1,
-    endsAt: timer ? new Date(Date.now() + timer * 1000) : null,
-  });
-  await tx.update(items).set({ status: 'voting' }).where(eq(items.id, itemId));
-  room.currentItemId = itemId;
-}
-
-export async function revealRound(tx: Tx, room: RoomRow, round: RoundRow) {
-  const roundVotes = await tx.select({ cardLabel: votes.cardLabel }).from(votes).where(eq(votes.roundId, round.id));
+async function startRound(tx: Tx, room: LockedRoom, itemId: string) {
+  const previous = room.currentItemId && room.currentItemId !== itemId ? room.currentItemId : null;
+  // New item goes to "voting"; the item we leave goes back to "pending" if it was being voted.
   await tx
-    .update(rounds)
-    .set({ revealedAt: new Date(), stats: computeStats(room.deck, roundVotes) })
-    .where(eq(rounds.id, round.id));
+    .update(items)
+    .set({ status: sql`case when ${items.id} = ${itemId} then 'voting'::item_status else 'pending'::item_status end` })
+    .where(previous ? or(eq(items.id, itemId), and(eq(items.id, previous), eq(items.status, 'voting'))) : eq(items.id, itemId));
+  const timer = room.settings.timerSeconds;
+  const [round] = await tx
+    .insert(rounds)
+    .values({
+      itemId,
+      number: sql`(select coalesce(max(${rounds.number}), 0) + 1 from ${rounds} where ${rounds.itemId} = ${itemId})`,
+      endsAt: timer ? new Date(Date.now() + timer * 1000) : null,
+    })
+    .returning();
+  room.currentItemId = itemId;
+  room.$round = round;
+  room.$roundFor = itemId;
 }
 
-const canVote = (p: ParticipantRow, room: RoomRow) =>
+export async function revealRound(tx: Tx, room: LockedRoom, round: RoundRow, knownVotes?: { cardLabel: string }[]) {
+  const roundVotes = knownVotes ?? (await tx.select({ cardLabel: votes.cardLabel }).from(votes).where(eq(votes.roundId, round.id)));
+  const revealedAt = new Date();
+  const stats = computeStats(room.deck, roundVotes);
+  await tx.update(rounds).set({ revealedAt, stats }).where(eq(rounds.id, round.id));
+  if (room.$round?.id === round.id) room.$round = { ...round, revealedAt, stats };
+}
+
+const canVote = (p: Pick<ParticipantRow, 'role'>, room: RoomRow) =>
   p.role === 'voter' || (p.role === 'facilitator' && room.settings.facilitatorVotes);
 
+type VoteStatus = { id: string; role: ParticipantRow['role']; cardLabel: string | null };
+
+/** Reveals the round if every online voter has a vote; `rows` = every active participant and their vote. */
+async function revealIfEveryoneVoted(tx: Tx, room: LockedRoom, round: RoundRow, rows: VoteStatus[], online: Set<string>) {
+  const eligible = rows.filter((p) => online.has(p.id) && canVote(p, room));
+  if (eligible.length === 0 || !eligible.every((p) => p.cardLabel !== null)) return;
+  const cast = rows.filter((r): r is VoteStatus & { cardLabel: string } => r.cardLabel !== null);
+  await revealRound(tx, room, round, cast);
+}
+
 /** Reveals the open round once every online voter has voted (if the room enables it). */
-export async function maybeAutoReveal(tx: Tx, room: RoomRow, online: Set<string>) {
+export async function maybeAutoReveal(tx: Tx, room: LockedRoom, online: Set<string>) {
   if (!room.settings.autoReveal) return;
   const round = await openRound(tx, room);
   if (!round) return;
-  const active = await tx
-    .select()
+  const rows = await tx
+    .select({ id: participants.id, role: participants.role, cardLabel: votes.cardLabel })
     .from(participants)
+    .leftJoin(votes, and(eq(votes.participantId, participants.id), eq(votes.roundId, round.id)))
     .where(and(eq(participants.roomId, room.id), isNull(participants.removedAt)));
-  const eligible = active.filter((p) => online.has(p.id) && canVote(p, room));
-  if (eligible.length === 0) return;
-  const voted = new Set(
-    (await tx.select({ id: votes.participantId }).from(votes).where(eq(votes.roundId, round.id))).map((v) => v.id),
-  );
-  if (eligible.every((p) => voted.has(p.id))) await revealRound(tx, room, round);
+  await revealIfEveryoneVoted(tx, room, round, rows, online);
 }
 
 /** Moves to the first pending item after `afterPosition` (wrapping around); clears the current item when none is left. */
-async function advance(tx: Tx, room: RoomRow, afterPosition: number) {
+async function advance(tx: Tx, room: LockedRoom, afterPosition: number) {
   const pending = await tx
     .select({ id: items.id, position: items.position })
     .from(items)
@@ -247,9 +320,13 @@ async function getTarget(tx: Tx, room: RoomRow, participantId: string) {
   return p;
 }
 
+/** Actions after which every online voter may have voted, which can complete the round. */
+// vote.cast checks this itself, in the same statement that saves the vote.
+const CAN_COMPLETE_ROUND = new Set<ParsedAction['type']>(['participant.setRole', 'participant.remove', 'room.update']);
+
 export async function applyAction(
   tx: Tx,
-  room: RoomRow,
+  room: LockedRoom,
   actor: ParticipantRow,
   action: ParsedAction,
   ctx: ActionContext,
@@ -263,13 +340,24 @@ export async function applyAction(
       if (!round) throw new ActionError('Não há votação aberta');
       const card = room.deck.cards.find((c) => c.label === action.label);
       if (!card) throw new ActionError('Card inválido');
-      await tx
-        .insert(votes)
-        .values({ roundId: round.id, participantId: actor.id, cardLabel: card.label, numericValue: card.value })
-        .onConflictDoUpdate({
-          target: [votes.roundId, votes.participantId],
-          set: { cardLabel: card.label, numericValue: card.value, updatedAt: new Date() },
-        });
+      // Saves the vote and reads everyone's vote status in a single statement (one round trip).
+      const status = await tx.execute<{ id: string; role: ParticipantRow['role']; card_label: string | null }>(sql`
+        with cast_vote as (
+          insert into ${votes} (round_id, participant_id, card_label, numeric_value)
+          values (${round.id}, ${actor.id}, ${card.label}, ${card.value})
+          on conflict (round_id, participant_id)
+            do update set card_label = excluded.card_label, numeric_value = excluded.numeric_value, updated_at = now()
+          returning participant_id, card_label
+        )
+        select p.id, p.role, coalesce(c.card_label, v.card_label) as card_label
+        from ${participants} p
+        left join ${votes} v on v.participant_id = p.id and v.round_id = ${round.id}
+        left join cast_vote c on c.participant_id = p.id
+        where p.room_id = ${room.id} and p.removed_at is null`);
+      if (room.settings.autoReveal) {
+        const rows = status.rows.map((r) => ({ id: r.id, role: r.role, cardLabel: r.card_label }));
+        await revealIfEveryoneVoted(tx, room, round, rows, ctx.online);
+      }
       break;
     }
 
@@ -388,25 +476,24 @@ export async function applyAction(
     }
 
     case 'comment.create': {
-      const item = await getItem(tx, room, action.itemId);
       let parentId: string | null = null;
       if (action.parentId) {
         const parent = await getComment(tx, room, action.parentId);
-        if (parent.itemId !== item.id) throw new ActionError('Comentário de outro item');
+        if (parent.itemId !== action.itemId) throw new ActionError('Comentário de outro item');
         parentId = parent.parentId ?? parent.id; // threads are one level deep
       }
-      let voteLabel: string | null = null;
-      if (action.attachVote) {
-        const round = await latestRound(tx, item.id);
-        if (round) {
-          const [v] = await tx
-            .select({ label: votes.cardLabel })
-            .from(votes)
-            .where(and(eq(votes.roundId, round.id), eq(votes.participantId, actor.id)));
-          voteLabel = v?.label ?? null;
-        }
-      }
-      await tx.insert(comments).values({ itemId: item.id, participantId: actor.id, parentId, body: action.body, voteLabel });
+      // The item check and the author's vote in the latest round ride along with the insert.
+      const voteLabel = action.attachVote
+        ? sql`(select v.card_label from ${votes} v where v.participant_id = ${actor.id}::uuid
+                 and v.round_id = (select r.id from ${rounds} r where r.item_id = i.id order by r.number desc limit 1))`
+        : sql`null`;
+      const inserted = await tx.execute(sql`
+        insert into ${comments} (item_id, participant_id, parent_id, body, vote_label)
+        select i.id, ${actor.id}::uuid, ${parentId}::uuid, ${action.body}::text, ${voteLabel}
+        from ${items} i
+        where i.id = ${action.itemId} and i.room_id = ${room.id}
+        returning id`);
+      if (inserted.rows.length === 0) throw new ActionError('Item não encontrado', 404);
       break;
     }
 
@@ -493,7 +580,7 @@ export async function applyAction(
     }
   }
 
-  await maybeAutoReveal(tx, room, ctx.online);
+  if (CAN_COMPLETE_ROUND.has(action.type)) await maybeAutoReveal(tx, room, ctx.online);
   return result;
 }
 
