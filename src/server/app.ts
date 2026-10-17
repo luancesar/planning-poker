@@ -39,7 +39,7 @@ export async function createAppServer({ databaseUrl, redisUrl, fallback }: Optio
   }
 
   const broadcaster = setupRealtime(io, db);
-  const sweeper = startSweeper(db, broadcaster);
+  const sweeper = startSweeper(db, broadcaster, () => io.engine.clientsCount > 0);
 
   return {
     server,

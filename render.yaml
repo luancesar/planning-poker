@@ -1,0 +1,18 @@
+# Render Blueprint: New + > Blueprint, aponte para este repositório.
+# O banco fica fora do Render (Neon free); cole a connection string em DATABASE_URL.
+services:
+  - type: web
+    name: planning-poker
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: NEXT_TELEMETRY_DISABLED
+        value: '1'
+      - key: DATABASE_URL
+        sync: false
